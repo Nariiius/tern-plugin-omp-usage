@@ -3,19 +3,18 @@
 // Saved resets appear only on 7d: (+N), or (!N - 3d 2h left) when an applicable
 // available credit expires within 5 days. Countdown is the earliest credit expiry.
 //
-// Shown for any model whose provider has an `omp usage` report with limits
-// (Anthropic, OpenAI Codex, Kimi, Gemini CLI, Muse Code, …); otherwise the
-// status is cleared. Tier/model-scoped windows (e.g. Codex Spark 5h, Claude
-// Fable 7d) are shown only when the active model belongs to that scope, so a
+// Shown only on a live Tern Surface Protocol surface, for models whose provider
+// has an `omp usage` report with limits. Other models retain a quota-control
+// availability marker when another provider has quotas. Tier/model-scoped
+// windows (e.g. Codex Spark 5h, Claude Fable 7d) apply only to matching models, so a
 // missing general window is never backfilled; a scope none of the provider's
 // models belong to names its plan and applies to every model. Windows of any
 // length are shown: 5h, 1d, 7d and mo by name, others by their length.
 //
-// Footer wiring: put "status" in statusLine.leftSegments/rightSegments (that
-// segment renders ctx.ui.setStatus values).
+// The native composer consumes ctx.ui.setStatus without adding a footer line.
 //
 // Source of truth is `omp usage --json` (same reports the `usage` segment and
-// `omp usage` use), polled every 60s and after each turn. omp has no extension
+// `omp usage` use), polled every 30s and after each turn. omp has no extension
 // event for a model switch, so the active model is checked every second; a
 // change redraws at once from the last reports (they cover every provider),
 // then fetches fresh ones.
@@ -26,17 +25,30 @@
 // a subagent's transcript is viewed (omp's chip then shows the subagent's
 // model, but the status stays the main session's) for that model's line.
 import { execFile } from "node:child_process";
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+// Use the running CLI's helpers: another installed copy has a different native-state singleton.
+async function ompModule(specifier) {
+  const cli = Bun.which(ompBin());
+  const base = cli ? dirname(realpathSync(cli)) : import.meta.dir;
+  return import(Bun.resolveSync(specifier, base));
+}
+
+const { resolveUsedFraction } = await ompModule("@oh-my-pi/pi-ai/usage");
+const { collapseSharedUsageReports, formatLimitTitle } = await ompModule("@oh-my-pi/pi-tui/overlays/usage-display");
+const { isNativeRendering, onNativeRenderingChange } = await ompModule("@oh-my-pi/pi-tui/native/state");
+
 const STATUS_KEY = "usage-remaining";
-const INTERVAL_MS = 60_000;
+const INTERVAL_MS = 30_000;
 const MODEL_CHECK_MS = 1_000;
 const RESET_EXPIRY_WARN_MS = 5 * 86_400_000;
 const TIMEOUT_MS = 15_000;
 const LINES_FILE = join(homedir(), ".omp", "cache", "usage-remaining.json");
 const LINES_REFRESH_MS = 120_000;
+const MAX_AGE_MS = 10 * 60_000;
+const AVAILABLE_STATUS = "Provider usage available";
 
 function ompBin() {
   const exe = process.execPath ?? "";
@@ -101,8 +113,7 @@ function spanLabel(ms) {
   return `${mins}m`;
 }
 
-// A limit's window as { key, label, ms }: `key` keeps one limit per window on
-// a line, `label` is what the line shows and `ms` orders the windows. The
+// A limit's window as { key, label, ms }; ms orders the windows. The
 // usual ones get fixed labels (5h, 1d, 7d, mo), matched by omp's id or their
 // length; any other is labeled by its length, else by omp's id for it, so an
 // unfamiliar window is shown rather than dropped.
@@ -179,9 +190,36 @@ function pickReport(reports, activeProvider) {
   return withLimits.find((r) => String(r.provider).toLowerCase() === activeProvider) ?? null;
 }
 
+// Match Usage overview's label/window buckets, retaining independently scoped models.
+export function combineReports(reports) {
+  const providers = new Map();
+  for (const report of collapseSharedUsageReports(reports)) {
+    const provider = String(report.provider).toLowerCase();
+    if (!providers.has(provider)) providers.set(provider, { provider, reports: [], buckets: new Map() });
+    const entry = providers.get(provider);
+    entry.reports.push(report);
+    for (const limit of report.limits) {
+      const key = JSON.stringify([formatLimitTitle(limit), limit.window?.id ?? limit.scope.windowId ?? "default",
+        scopeText(limit.scope.modelId), scopeText(limit.scope.tier)]);
+      if (!entry.buckets.has(key)) entry.buckets.set(key, []);
+      entry.buckets.get(key).push({ report, limit });
+    }
+  }
+  return [...providers.values()].map(({ provider, reports, buckets }) => ({
+    provider, reports,
+    limits: [...buckets.values()].map((sources) => {
+      const fractions = sources.map(({ limit }) => resolveUsedFraction(limit)).filter((n) => n !== undefined);
+      const worst = sources.reduce((a, b) =>
+        (resolveUsedFraction(b.limit) ?? -1) > (resolveUsedFraction(a.limit) ?? -1) ? b : a).limit;
+      return { ...worst, sources, amount: { usedFraction: fractions.length
+        ? fractions.reduce((sum, n) => sum + n, 0) / fractions.length : undefined } };
+    }),
+  }));
+}
+
 // The bare ids of each provider's available models (ctx.models.list()), by
 // provider; null when the list isn't known.
-function modelIndex(models) {
+export function modelIndex(models) {
   if (!Array.isArray(models)) return null;
   const index = new Map();
   for (const m of models) {
@@ -231,6 +269,7 @@ function appliesTo(report, bare, index) {
 // they clear (Anthropic) count only toward those windows; credits without that
 // list (Codex) count toward every non-monthly window.
 function stashFor(report, limit, wc) {
+  if (limit.sources) return limit.sources.reduce((sum, source) => sum + stashFor(source.report, source.limit, wc), 0);
   const rc = report?.resetCredits;
   if (!rc || wc === "monthly") return 0;
   const credits = Array.isArray(rc.credits) ? rc.credits : [];
@@ -246,6 +285,11 @@ function stashFor(report, limit, wc) {
 
 // Find the earliest applicable saved-reset expiry within the warning window.
 function expiringResetLeft(report, limit, wc, now) {
+  if (limit.sources) {
+    const expiries = limit.sources.map((source) => expiringResetLeft(source.report, source.limit, wc, now))
+      .filter((expiry) => expiry !== undefined);
+    return expiries.length ? Math.min(...expiries) : undefined;
+  }
   if (wc === "monthly") return undefined;
   const credits = Array.isArray(report?.resetCredits?.credits) ? report.resetCredits.credits : [];
   let soonest = Infinity;
@@ -263,15 +307,16 @@ function expiringResetLeft(report, limit, wc, now) {
 // The saved resets counted on a model's 7d window, soonest expiry first, as
 // [{ expiresAt (epoch ms), count }]. Same credit filter as expiringResetLeft,
 // without the 5-day warning window.
-function savedResets(report, applies) {
-  const limit = (report.limits ?? []).find((l) => applies(l) && windowOf(l)?.key === "7d");
-  if (!limit) return [];
+export function savedResets(report, applies) {
+  if (report.reports) return report.reports.flatMap((r) => savedResets(r, applies)).sort((a, b) => a.expiresAt - b.expiresAt);
+  const limits = (report.limits ?? []).filter((l) => applies(l) && windowOf(l)?.key === "7d");
+  if (!limits.length) return [];
   const credits = Array.isArray(report.resetCredits?.credits) ? report.resetCredits.credits : [];
   const now = Date.now();
   const out = [];
   for (const c of credits) {
     if (c?.status !== "available" || c.usable === false || c.remainingCount <= 0) continue;
-    if (Array.isArray(c.clears) && !c.clears.includes(limit.id)) continue;
+    if (Array.isArray(c.clears) && !limits.some((limit) => c.clears.includes(limit.id))) continue;
     const expiresAt = Date.parse(c.expiresAt);
     if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
     out.push({ expiresAt, count: typeof c.remainingCount === "number" ? c.remainingCount : 1 });
@@ -281,22 +326,16 @@ function savedResets(report, applies) {
 
 function renderRemaining(report, applies) {
   const now = Date.now();
-  const seen = new Map();
-  for (const limit of report.limits) {
-    if (!applies(limit)) continue;
+  const parts = [];
+  const limits = report.limits.filter(applies);
+  for (const limit of limits) {
     const w = windowOf(limit);
-    if (!w || seen.has(w.key)) continue;
-    const amount = limit.amount ?? {};
-    const remainingFrac =
-      typeof amount.remainingFraction === "number"
-        ? amount.remainingFraction
-        : typeof amount.usedFraction === "number"
-          ? 1 - amount.usedFraction
-          : undefined;
-    if (typeof remainingFrac !== "number") continue;
-    const pct = w.key === "monthly" ? Math.floor(remainingFrac * 100) : Math.round(remainingFrac * 100);
+    const used = resolveUsedFraction(limit);
+    if (!w || used === undefined) continue;
+    const remainingFrac = Math.max(0, 1 - used);
+    const pct = Math.round(remainingFrac * 100);
     const filled = Math.round(Math.min(1, Math.max(0, remainingFrac)) * 8);
-    const meter = `${"\u2588".repeat(filled)}${"\u2591".repeat(8 - filled)}`;
+    const meter = `${"█".repeat(filled)}${"░".repeat(8 - filled)}`;
     const stash = w.key === "7d" ? stashFor(report, limit, w.key) : 0;
     const expiryLeft = stash > 0 ? expiringResetLeft(report, limit, w.key, now) : undefined;
     const extra = stash <= 0
@@ -306,40 +345,63 @@ function renderRemaining(report, applies) {
         : ` (!${stash} - ${fmtResetShort(expiryLeft)} left)`;
     const resetsAt = limit.window?.resetsAt;
     const reset = typeof resetsAt === "number" ? ` (${fmtResetShort(resetsAt - now)})` : "";
-    seen.set(w.key, { ms: w.ms, text: `${w.label} ${meter} ${pct}% left${reset}${extra}` });
+    const siblings = limits.filter((l) => windowOf(l)?.key === w.key);
+    let label = w.label;
+    if (siblings.length > 1 || limit.scope.modelId || limit.scope.tier) {
+      const title = formatLimitTitle(limit);
+      const model = limit.scope.modelId;
+      label += ` ${title}${model && !title.toLowerCase().includes(model.toLowerCase()) ? ` (${model})` : ""}`;
+    }
+    parts.push({ ms: w.ms, text: `${label} ${meter} ${pct}% left${reset}${extra}` });
   }
-  if (!seen.size) return undefined;
-  const parts = [...seen.values()]
+  if (!parts.length) return undefined;
+  const texts = parts
     .sort((a, b) => (a.ms === b.ms ? 0 : a.ms < b.ms ? -1 : 1))
     .map((p) => p.text);
-  return `${shortProvider(report.provider)} ${parts.join(" · ")}`;
+  return `${shortProvider(report.provider)} ${texts.join(" · ")}`;
 }
 
-// The status for a model from fetched reports; "" when its provider isn't
-// tracked or has no report. With no model (`bare` ""), the provider's
-// plan-wide windows; a provider whose limits are all scoped to some of its
-// models shows those instead, so a provider with limits is never left out.
-function lineFor(reports, provider, bare, index) {
+// The status for a model from combined reports; provider lines retain every scope.
+export function lineFor(reports, provider, bare, index) {
   if (!isTrackedProvider(provider)) return "";
   const report = pickReport(reports, provider);
   if (!report) return "";
-  const line = renderRemaining(report, appliesTo(report, bare, index));
-  if (line || bare) return line || "";
-  return renderRemaining(report, () => true) || "";
+  return renderRemaining(report, bare ? appliesTo(report, bare, index) : () => true) || "";
 }
 
-// Draws the status for the active model from the last fetched reports. With
-// none yet, a tracked model keeps the current status until the fetch lands.
+function readLines() {
+  try {
+    const cached = JSON.parse(readFileSync(LINES_FILE, "utf8"));
+    const age = Date.now() - cached?.generatedAt;
+    return Number.isFinite(age) && age >= 0 && age <= MAX_AGE_MS ? cached : null;
+  } catch {
+    return null;
+  }
+}
+
+function cachedLine(state, ctx) {
+  if (!state.cache || Date.now() - state.cache.generatedAt > MAX_AGE_MS) return undefined;
+  const current = ctx.models?.current?.() ?? ctx.model;
+  const entry = state.cache.models?.[chipName(current)];
+  if (typeof entry?.line === "string" && entry.line) return entry.line;
+  return Object.values(state.cache.providers ?? {}).some((p) => typeof p?.line === "string" && p.line)
+    ? AVAILABLE_STATUS : undefined;
+}
+
+// A capability marker keeps All/Selected provider controls available without
+// pretending another provider's quotas apply to the current model.
 function render(state, ctx) {
   const { provider, bare } = activeModel(ctx);
   state.shownModel = `${provider}/${bare}`;
-  if (!isTrackedProvider(provider)) {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+  if (!state.data || Date.now() - state.dataAt > MAX_AGE_MS) {
+    ctx.ui.setStatus(STATUS_KEY, cachedLine(state, ctx));
     return;
   }
-  const reports = state.data && Array.isArray(state.data.reports) ? state.data.reports : null;
-  if (!reports) return;
-  ctx.ui.setStatus(STATUS_KEY, lineFor(reports, provider, bare, modelIndex(state.models)) || undefined);
+  const reports = state.data.reports;
+  const index = modelIndex(state.models);
+  const line = lineFor(reports, provider, bare, index);
+  ctx.ui.setStatus(STATUS_KEY, line ||
+    (reports.some((r) => lineFor(reports, r.provider, "", index)) ? AVAILABLE_STATUS : undefined));
 }
 
 // Writes LINES_FILE:
@@ -348,15 +410,14 @@ function render(state, ctx) {
 //   Two models sharing a chip name but not an entry can't be told apart from
 //   the chip: they get null, and the plugin keeps the main status.
 // - providers: every tracked provider with limits, keyed by provider id, in
-//   report order, as { label, line, resets } for its plan-wide windows (see
-//   lineFor; no model is given, so tier/model-scoped windows are left out).
-async function writeLines(state) {
+//   report order, as { label, line, resets }, retaining every quota scope.
+function writeLines(state) {
   const reports = state.data && Array.isArray(state.data.reports) ? state.data.reports : null;
   const models = state.models;
-  if (!reports || !Array.isArray(models)) return;
+  if (!reports) return;
   const index = modelIndex(models);
   const entries = {};
-  for (const m of models) {
+  for (const m of models ?? []) {
     const name = chipName(m);
     if (!name) continue;
     const { provider, bare } = identity(m);
@@ -378,63 +439,124 @@ async function writeLines(state) {
     providers[provider] = {
       label: shortProvider(provider),
       line,
-      resets: savedResets(report, appliesTo(report, "", index)),
+      resets: savedResets(report, () => true),
     };
   }
   const body = JSON.stringify({ entries, providers });
-  // Unchanged data is still rewritten now and then, so generatedAt tells readers the file is live.
+  // Refresh unchanged successful snapshots without renewing a provider's fetchedAt.
   const now = Date.now();
   if (body === state.writtenLines && now - state.writtenAt < LINES_REFRESH_MS) return;
   mkdirSync(dirname(LINES_FILE), { recursive: true });
   const tmp = `${LINES_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ generatedAt: now, models: entries, providers }));
+  writeFileSync(tmp, JSON.stringify({ generatedAt: state.dataAt, models: entries, providers }));
   renameSync(tmp, LINES_FILE);
   state.writtenLines = body;
   state.writtenAt = now;
 }
 
-async function update(state, ctx) {
-  try {
-    // Fetched whatever the main model is: a viewed subagent can use another provider.
-    const data = await fetchUsageJson();
-    // A failed fetch keeps the last good reports; the next poll retries.
-    if (data && Array.isArray(data.reports)) state.data = data;
-    const models = await ctx.models?.list?.();
-    if (Array.isArray(models)) state.models = models;
-    render(state, ctx);
-    await writeLines(state);
-  } catch {
-    // Keep the last good value; the next poll retries.
-  }
+function update(state, ctx, runtime) {
+  if (!state.enabled || !runtime.isNativeRendering() || state.pending) return state.pending;
+  state.pending = (async () => {
+    try {
+      // The model inventory is stable across polls; retry only if unavailable.
+      if (!state.models) {
+        try {
+          const models = await ctx.models?.list?.();
+          if (Array.isArray(models)) state.models = models;
+        } catch {
+          // Provider-wide data remains useful even without a model inventory.
+        }
+      }
+      if (!state.enabled || !runtime.isNativeRendering()) return;
+      const data = await runtime.fetchUsageJson();
+      if (!state.enabled || !runtime.isNativeRendering()) return;
+      // Failure must not renew the age of the last good reports or cache.
+      if (data && Array.isArray(data.reports)) {
+        const now = Date.now();
+        const reports = data.reports.filter((r) =>
+          typeof r?.fetchedAt !== "number" || (r.fetchedAt <= now && now - r.fetchedAt <= MAX_AGE_MS));
+        state.data = { reports: combineReports(reports) };
+        state.dataAt = reports.reduce((at, r) => Math.min(at, r.fetchedAt ?? now), now);
+        runtime.writeLines(state);
+      }
+    } catch {
+      // Keep the last good value until it expires; the next poll retries.
+    } finally {
+      state.pending = null;
+      if (state.enabled && runtime.isNativeRendering()) render(state, ctx);
+    }
+  })();
+  return state.pending;
 }
 
-function checkModel(state, ctx) {
+function checkModel(state, ctx, runtime) {
+  if (!state.enabled || !runtime.isNativeRendering()) return;
   try {
     const { provider, bare } = activeModel(ctx);
-    if (`${provider}/${bare}` === state.shownModel) return;
+    const changed = `${provider}/${bare}` !== state.shownModel;
+    // Also expires a last-good display while provider requests are failing.
     render(state, ctx);
-    void update(state, ctx);
+    if (!changed) return;
+    if (state.models && !state.models.some((m) => {
+      const id = identity(m);
+      return id.provider === provider && id.bare === bare;
+    })) state.models = null;
+    void update(state, ctx, runtime);
   } catch {
     // The next check retries.
   }
 }
 
-export default function usageRemaining(pi) {
-  // Per session: the last `omp usage --json` reports and available models, the
-  // model last drawn and the lines last written to LINES_FILE, and when.
-  const state = { data: null, models: null, shownModel: undefined, writtenLines: undefined, writtenAt: 0 };
-  pi.on("session_start", async (_event, ctx) => {
-    await update(state, ctx);
-    ctx.setInterval(() => {
-      void update(state, ctx);
-    }, INTERVAL_MS);
-    ctx.setInterval(() => checkModel(state, ctx), MODEL_CHECK_MS);
+export default function usageRemaining(pi, runtime = {
+  isNativeRendering, onNativeRenderingChange, fetchUsageJson, readLines, writeLines,
+}) {
+  let currentState;
+  let stop;
+  pi.on("session_start", (_event, ctx) => {
+    stop?.();
+    // Retired states stay disabled, so their in-flight fetches cannot publish.
+    const state = {
+      data: null, dataAt: 0, cache: null, models: null, pending: null, enabled: false,
+      shownModel: undefined, writtenLines: undefined, writtenAt: 0,
+    };
+    currentState = state;
+    let timers = [];
+    const activate = (native) => {
+      if (native === state.enabled) return;
+      state.enabled = native;
+      if (!native) {
+        for (const timer of timers) ctx.clearTimer(timer);
+        timers = [];
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+      state.cache = runtime.readLines();
+      render(state, ctx);
+      timers = [
+        ctx.setInterval(() => void update(state, ctx, runtime), INTERVAL_MS),
+        ctx.setInterval(() => checkModel(state, ctx, runtime), MODEL_CHECK_MS),
+      ];
+      void update(state, ctx, runtime);
+    };
+    const unsubscribe = runtime.onNativeRenderingChange(activate);
+    stop = () => {
+      state.enabled = false;
+      for (const timer of timers) ctx.clearTimer(timer);
+      timers = [];
+      unsubscribe();
+    };
+    activate(runtime.isNativeRendering());
   });
-  pi.on("turn_end", async (_event, ctx) => {
-    await update(state, ctx);
+  pi.on("session_shutdown", () => {
+    stop?.();
+    stop = undefined;
+    currentState = undefined;
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    if (currentState) void update(currentState, ctx, runtime);
   });
   // An auto-retry fallback can switch provider mid-turn.
-  pi.on("retry_fallback_applied", async (_event, ctx) => {
-    checkModel(state, ctx);
+  pi.on("retry_fallback_applied", (_event, ctx) => {
+    if (currentState) checkModel(currentState, ctx, runtime);
   });
 }
