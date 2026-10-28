@@ -1,51 +1,16 @@
 --!strict
--- Shows what omp's `usage-remaining` extension (omp/extensions/usage-remaining.js in this repo) reports, as one
--- line above the composer's context hairline (the `1% ──── 1M` row).
---
--- The extension stays the source of truth: it picks the active model's provider, its applicable windows,
--- saved resets and countdowns. It sets that line with `ctx.ui.setStatus`, which omp draws in the composer bar's
--- extras, and after every fetch it also writes ~/.omp/cache/usage-remaining.json: every model's line keyed by
--- the name omp's model chip shows, every provider's plan-wide line, and the saved resets' expiry dates. This
--- plugin reads both from the focused agent pane and draws the line with CSS above the hairline's meter,
--- rewritten with `tern.css` when it changes. Other `ctx.ui.setStatus` parts are drawn there too, except the
--- `◫ …` context gauge (context-used.js), which the hairline already shows. The rest of omp's status line (path,
--- git, cost, …) stays in the bar; only the facts the line redraws are hidden there, in the focused pane.
---
--- What the line shows depends on the mode (kept in `tern.kv`, set from the settings panel or the `omp Usage:
--- Settings…` picker): the focused agent's provider (`current`), every provider in the cache (`all`) or the
--- chosen ones (`selected`), in the user's order. While a subagent's transcript is viewed (omp adds a `Viewing
--- <agent>` row to the composer and its model chip shows the subagent's model, but the status stays the main
--- session's), `current` shows the line the cache holds for that chip; otherwise it shows the status, which is
--- fresher. Without a fresh cache every mode falls back to the status.
---
--- The line is an instrument strip: per provider its label, then per window its label, a slim bar filled to the
--- share left with a lit tip, the share and its reset countdown, then saved resets; other statuses last. Each
--- provider has its colors (a preset, or the user's choice), one for its label and one or two for its bars;
--- a window at 25% or less turns `--warn`, at 10% or less `--bad`. It is the meter's `::before`: 10px mono,
--- whose glyphs are all 0.6em wide, so one static gradient clipped to the text colors each part and fills each
--- bar to the exact share (Tern draws one `background-clip: text` layer per element, and doesn't repaint it when
--- its position animates, so nothing in it moves). A window's parts are joined by no-break spaces, so in a
--- narrow pane a window that doesn't fit wraps, whole, onto a second line the 13px box cuts off; its tip, on the
--- meter's `::after`, is sized to nothing past the box's width, so it goes too.
---
--- Hovering the line lifts it into a glass capsule at full strength and, after a beat, opens a card above it with
--- the facts spelled out: a row and a meter per window, with its reset countdown and clock time, each saved
--- reset's expiry date, and other statuses. Tern draws its own tooltips from `title` attributes, which a plugin
--- can't set on omp's nodes, and it shows the nearest `title` up the tree, so neither can hang off the meter
--- (its context tooltip would show too). The hover target is the composer's attachment-chips row instead: empty
--- and hidden unless something is attached, untitled all the way up, and a direct child of the composer like the
--- meter, so it can be laid over the line with the meter's own offsets. While attachments show, the line stays
--- but doesn't react to hover.
---
--- When a window's share changes (a window is its provider and its label, so switching providers or modes
--- doesn't count), the line prints again, left to right, while a comet runs each changed bar to its new level
--- and settles into its tip: in the provider's color when quota went down, `--ok` when it came back. Nothing
--- moves at rest, and Reduce Motion (either Tern's or the system's) drops every fade, rise and sweep.
+-- Shows provider quota icons in an independent native composer item, after session cost and before Stop.
+-- The usage-remaining extension combines accounts using omp's Usage overview rules and refreshes the cache.
+-- Its dedicated native role keeps quota styling and hover details away from the stock session-cost control.
+-- Only the focused composer shows icons; inactive costs and unrelated extension statuses keep native layout.
+-- Inline windows prefer 5h, then 7d, then monthly; exhausted windows stay visible beside the next window.
+-- Bar and hover windows are independently configurable per provider; clicking opens the unfiltered Usage view.
+-- Settings live in the command palette (omp Usage: Settings); no default shortcut or extra status-bar item.
 
--- Re-reads the composer dock (~40 nodes) every second, and the cache's text (a few KB, decoded only when it
--- changed) as `poll_cache` last fetched it. The usage-remaining extension redraws within a second of a model
--- switch, so this follows it within about two.
-local POLL_MS = 1000
+-- Cheap focus/settings checks never read a surface. Dock observation, cache completion and painting each
+-- get their own callback; combining them can exceed Tern's 50ms hook budget and disable every plugin timer.
+local POLL_MS = 500
+local DOCK_POLL_MS = 2000
 local SHEET = "usage"
 -- omp's composer bar extras: one `hook-N` fact per `ctx.ui.setStatus` key with `statusLine.showHookStatus`,
 -- or one `status` fact (all keys joined) with the `status` statusline segment, beside the status line's own
@@ -75,9 +40,6 @@ local WARN_AT = 25
 local BAD_AT = 10
 -- A saved reset expiring this soon reads `--warn` in the card (the extension flags it with `!` in the line).
 local RESET_WARN_MS = 5 * 86400 * 1000
--- How long a change's comets run; a comet for quota that came back is `--ok`, else its bar's color.
-local PULSE_MS = 1400
-local PULSE_UP = "var(--ok)"
 
 -- The line's geometry. Its 10px var(--mono) is Berkeley Mono: every glyph it uses is 6px wide.
 local GLYPH = 6
@@ -85,13 +47,7 @@ local NBSP = "\194\160" -- U+00A0, which joins a window's parts so it wraps whol
 local BAR = "━"
 local BAR_GLYPHS = 8
 local COMPACT_BAR_GLYPHS = 6 -- with several providers on the line
-local BAR_Y = 7.25 -- px: the bar glyphs' center in the line's 13px box
 local TIP_W, TIP_H = 10, 6
--- The comet: its head and trail, and where in the run (0–1) it sets off, arrives and has flared.
-local HEAD_W, HEAD_H = 18, 7
-local TRAIL_W, TRAIL_H = 34, 2
-local RUN_SET, RUN_ARRIVE, RUN_FLARE = 0.05, 0.6, 0.72
-local RUN_STOPS = { 0, 0.05, 0.12, 0.2, 0.28, 0.36, 0.44, 0.52, 0.6, 0.66, 0.72, 0.84, 1 }
 -- The card: 11px var(--mono) in 18px rows, at least 28 glyphs wide.
 local CARD_ROW = 18
 local CARD_MIN = 28
@@ -171,6 +127,7 @@ local KV_MODE = "omp-usage.mode"
 local KV_SELECTED = "omp-usage.selected"
 local KV_COLORS = "omp-usage.colors"
 local KV_ORDER = "omp-usage.order"
+local KV_WINDOWS = "omp-usage.windows"
 
 type Window = { label: string, pct: number, reset: string?, saved: number?, expires: string? }
 type Reset = { at: number, count: number }
@@ -187,23 +144,18 @@ type Model = {
 	signature: string,
 }
 -- `hide`: the ids of the status facts the line redraws, to hide in the bar.
-type Dock = { status: string?, chip: string?, viewing: boolean, hide: { string } }
+type Dock = { status: string?, chip: string?, native: boolean?, viewing: boolean, hide: { string } }
 type Provider = { id: string, label: string, line: string, resets: { Reset } }
 type Entry = { line: string, resets: { Reset } }
 type Cache = { at: number, models: { [string]: Entry }, providers: { Provider }? }
-type Settings = { mode: string, selected: { string }, colors: { [string]: string }, order: { string } }
--- `moved`: the windows (by provider and label) whose share changed, and which way.
-type Pulse = { seq: number, until_ms: number, moved: { [string]: string } }
+type WindowVisibility = { bar: boolean?, hover: boolean? }
+type Settings = { mode: string, selected: { string }, colors: { [string]: string }, order: { string }, windows: { [string]: { [string]: WindowVisibility } } }
 -- A card row: its text and color and, for a window, the share at its right and its meter's share and colors;
 -- `rule` draws a hairline over it.
 type Row = { text: string, color: string, right: string?, share: number?, a: string?, b: string?, rule: boolean? }
 
 local last_css: string? = nil
 local shown_pane: number? = nil
--- pane -> where its line came from and each window's share, by provider and window
-local last_seen: { [number]: { source: string, values: { [string]: number } } } = {}
-local pulse: Pulse? = nil
-local pulse_seq = 0
 -- The card's rows for the last model (see `card`).
 local card_for: string? = nil
 local card_rows: { Row } = {}
@@ -292,6 +244,31 @@ end
 local function usage_part(status: string): string
 	return table.concat(usage_pieces(status), SEPARATOR)
 end
+-- One usage-remaining.js window, `[Provider ]<label> <meter> <N>% left[ (<reset>)][ (+N) | (!N - <left> left)]`,
+-- and the provider in front of it, if any.
+local function parse_window(piece: string): (Window?, string?)
+	local head, label, pct, rest = string.match(piece, "^(.-)(%d+[dhm].-) %S+ (%d+)%% left(.*)$")
+	if label == nil then
+		head, label, pct, rest = string.match(piece, "^(.-)(mo.-) %S+ (%d+)%% left(.*)$")
+	end
+	if label == nil then
+		return nil, nil
+	end
+	local window: Window = { label = label :: string, pct = tonumber(pct) :: number }
+	for group in string.gmatch(rest :: string, "%((.-)%)") do
+		local plus = string.match(group, "^%+(%d+)$")
+		local n, expires = string.match(group, "^!(%d+) %- (.+) left$")
+		if plus then
+			window.saved = tonumber(plus)
+		elseif n then
+			window.saved, window.expires = tonumber(n), expires
+		else
+			window.reset = group
+		end
+	end
+	local provider = string.match(head :: string, "^(.-)%s*$")
+	return window, if provider and provider ~= "" then provider else nil
+end
 
 -- From a dock tree (`cx.session:surface`'s answer): the status facts joined, the ones the line redraws, the
 -- model chip's name, and whether a subagent's transcript is being viewed.
@@ -303,21 +280,33 @@ local function dock_facts(tree: any): Dock
 	local function find(test: (any) -> boolean): any
 		return find_node(tree.main, test) or find_node(tree.dock, test)
 	end
+	local quota = find(role_is("omp.composer.provider-usage.data"))
+	dock.native = quota ~= nil
+	if quota and type(quota.p) == "table" and type(quota.p.text) == "string" then
+		dock.status = quota.p.text
+	end
 	local extras = find(id_ends(EXTRAS_SUFFIX))
 	if extras ~= nil and type(extras.c) == "table" then
 		local parts: { string } = {}
 		for _, child in ipairs(extras.c) do
 			if type(child) == "table" and is_status_fact(child.id) then
 				local text = fact_text(child)
-				if text ~= "" then
-					table.insert(parts, text)
-					if #usage_pieces(text) > 0 then
-						table.insert(dock.hide, child.id)
+				local pieces = usage_pieces(text)
+				local quota_only = #pieces > 0 and table.concat(pieces, SEPARATOR) == text
+				for _, piece in pieces do
+					if parse_window(piece) then
+						table.insert(parts, piece)
+					else
+						quota_only = false
 					end
+				end
+				-- Mixed facts must stay intact: hiding one would also remove another extension's status.
+				if quota_only then
+					table.insert(dock.hide, child.id)
 				end
 			end
 		end
-		dock.status = table.concat(parts, SEPARATOR)
+		dock.status = dock.status or table.concat(parts, SEPARATOR)
 	end
 	local chip = find(role_is(MODEL_ROLE))
 	local name = if chip then find_node(chip, id_ends(NAME_SUFFIX)) else nil
@@ -333,11 +322,50 @@ local function dock_facts(tree: any): Dock
 	return dock
 end
 
-local function read_dock(cx: WindowCx, pane: number): Dock
+do
+	local quota = "Codex 5h ████████ 80% left (2h)"
+	local function fact(id: string, text: string): any
+		return { id = id, p = { spans = { { t = text } } } }
+	end
+	local function dock_for(facts: { any }): Dock
+		return dock_facts({ dock = { id = "dock/bar/extras", c = facts } })
+	end
+	local dock = dock_for({ fact("dock/hook-0", "ponytail: FULL"), fact("dock/hook-1", quota) })
+	assert(dock.status == quota and #dock.hide == 1 and dock.hide[1] == "dock/hook-1")
+	local mixed = dock_for({ fact("dock/status", "ponytail: FULL" .. SEPARATOR .. quota) })
+	assert(mixed.status == quota and #mixed.hide == 0)
+	local unrelated = dock_for({ fact("dock/hook-0", "ponytail: FULL") })
+	assert(unrelated.status == "" and #unrelated.hide == 0)
+	local bar = { id = "27.bar", p = { role = "omp.composer.bar" }, c = {
+		{ id = "27.bar/model", p = { role = MODEL_ROLE }, c = { fact("27.bar/model/name", "Fixture") } },
+		{ id = "27.bar/provider-usage/data", p = { role = "omp.composer.provider-usage.data", text = quota } },
+	} }
+	assert(find_node({ c = { bar } }, role_is("omp.composer.bar")) == bar)
+	local native = dock_facts({ dock = bar })
+	assert(native.chip == "Fixture" and native.native and native.status == quota)
+end
+local bar_roots: { [number]: string } = {}
+local function read_dock(cx: WindowCx, pane: number): Dock?
+	local root = bar_roots[pane]
 	local ok, tree = pcall(function()
-		return cx.session:surface(pane, { root = DOCK_ROOT })
+		return cx.session:surface(pane, if root
+			then { root = root, depth = 8, nodes = 128, max_chars = 16384 }
+			else { root = DOCK_ROOT, depth = 2, nodes = 48, max_chars = 256 })
 	end)
-	return dock_facts(if ok then tree else nil)
+	if not ok then
+		tern.log.warn("omp Usage: dock read failed", tree)
+		return nil
+	end
+	local bar = if type(tree) == "table"
+		then find_node(tree.main, role_is("omp.composer.bar")) or find_node(tree.dock, role_is("omp.composer.bar"))
+		else nil
+	if bar == nil or type(bar.id) ~= "string" then
+		bar_roots[pane] = nil
+		return nil
+	end
+	bar_roots[pane] = bar.id
+	-- Discovery excludes the draft's descendants; read only the discovered bar in the next callback.
+	return if root then dock_facts(tree) else nil
 end
 
 -- usage-remaining.js countdowns (`45m`, `2h 11m`, `5h`, `6d 4h`): minutes, and whether they are exact to the
@@ -410,28 +438,6 @@ local function reset_text(reset: Reset, now: number): string?
 	return string.format("%s · expires %s, %s · in %s", what, date, clock(t), span(reset.at - now))
 end
 
--- One usage-remaining.js window, `[Provider ]<label> <meter> <N>% left[ (<reset>)][ (+N) | (!N - <left> left)]`,
--- and the provider in front of it, if any.
-local function parse_window(piece: string): (Window?, string?)
-	local head, label, pct, rest = string.match(piece, "^(.-)(%S+) %S+ (%d+)%% left(.*)$")
-	if label == nil then
-		return nil, nil
-	end
-	local window: Window = { label = label :: string, pct = tonumber(pct) :: number }
-	for group in string.gmatch(rest :: string, "%((.-)%)") do
-		local plus = string.match(group, "^%+(%d+)$")
-		local n, expires = string.match(group, "^!(%d+) %- (.+) left$")
-		if plus then
-			window.saved = tonumber(plus)
-		elseif n then
-			window.saved, window.expires = tonumber(n), expires
-		else
-			window.reset = group
-		end
-	end
-	local provider = string.match(head :: string, "^(.-)%s*$")
-	return window, if provider and provider ~= "" then provider else nil
-end
 
 -- A usage line, `<Label> <window> · <window>`, or a status with other parts between: the label in front of
 -- the first window, the windows, and the other parts as they are.
@@ -527,12 +533,23 @@ local function fresh_cache(parsed: Cache?, seen: { at: number, list: { Provider 
 	return parsed
 end
 
+local refresh: (cx: WindowCx) -> ()
+local refresh_pending = false
+local function request_refresh()
+	if refresh_pending then return end
+	refresh_pending = true
+	tern.timer(0, function(cx: WindowCx?)
+		refresh_pending = false
+		if cx then refresh(cx) end
+	end)
+end
 -- The cache file's text as last read (nil until it has been). `tern.fs.read` would read it on the window's thread,
 -- and opening the file just after omp rewrites it can wait on another program (a virus scan) for longer than a
 -- timer's 50 ms budget, which, tripped, turns off every timer of the plugin until a reload; so it is read with
 -- `cx.docs:read`, whose answer comes back later, every few seconds.
 local CACHE_POLL_MS = 3000
 local cache_text: string? = nil
+local cache_read_pending = false
 
 local CACHE_PATH: string? = (function(): string?
 	local home = tern.getenv("USERPROFILE") or tern.getenv("HOME")
@@ -542,19 +559,24 @@ end)()
 local function poll_cache(cx: WindowCx?)
 	tern.timer(CACHE_POLL_MS, poll_cache)
 	local path = CACHE_PATH
-	if cx == nil or path == nil then
+	if cx == nil or path == nil or cache_read_pending then
 		return
 	end
-	local ok, reading = pcall(function(): any
-		return (cx :: WindowCx).docs:read(path :: string)
-	end)
-	if ok and reading then
-		-- a failed read (the file being replaced, or gone) keeps the last text: it goes stale on its own
+	cache_read_pending = true
+	local ok, err = pcall(function()
+		local reading = (cx :: WindowCx).docs:read(path :: string)
+		-- A missing/replaced file keeps the last good cache, which expires normally.
 		reading:next(function(text: string?, _err: string?, _later: WindowCx?)
-			if type(text) == "string" and #text <= CACHE_MAX_BYTES then
+			cache_read_pending = false
+			if type(text) == "string" and #text <= CACHE_MAX_BYTES and text ~= cache_text then
 				cache_text = text
+				request_refresh()
 			end
 		end)
+	end)
+	if not ok then
+		cache_read_pending = false
+		tern.log.warn("omp Usage: cache read failed", err)
 	end
 end
 
@@ -619,8 +641,68 @@ local function id_list(value: any): { string }
 	return list
 end
 
+local function window_preferences(value: any): { [string]: { [string]: WindowVisibility } }
+	local providers: { [string]: { [string]: WindowVisibility } } = {}
+	if type(value) ~= "table" then return providers end
+	for id, windows in value do
+		if type(id) ~= "string" or type(windows) ~= "table" then continue end
+		local entries: { [string]: WindowVisibility } = {}
+		for label, surfaces in windows do
+			if type(label) ~= "string" or type(surfaces) ~= "table" then continue end
+			local flags: WindowVisibility = {}
+			if type(surfaces.bar) == "boolean" then flags.bar = surfaces.bar end
+			if type(surfaces.hover) == "boolean" then flags.hover = surfaces.hover end
+			if next(flags) then entries[label] = flags end
+		end
+		if next(entries) then providers[id] = entries end
+	end
+	return providers
+end
+
+local function window_enabled(settings: Settings, provider: string, label: string, surface: string): boolean
+	local preferences = settings.windows[provider]
+	if preferences == nil then return true end
+	local flags = preferences[label]
+	if flags and (flags :: any)[surface] ~= nil then return (flags :: any)[surface] end
+	local duration = string.match(label, "^%S+") or label
+	local generic = preferences[duration]
+	return generic == nil or (generic :: any)[surface] ~= false
+end
+local function visible_windows(settings: Settings, group: Group, surface: string): { Window }
+	local preferences = settings.windows[group.id or group.key]
+	if preferences == nil then return group.windows end
+	local windows: { Window } = {}
+	for _, window in group.windows do
+		if window_enabled(settings, group.id or group.key, window.label, surface) then table.insert(windows, window) end
+	end
+	return windows
+end
+
+local function visibility_key(settings: Settings): string
+	local parts: { string } = {}
+	for id, windows in settings.windows do
+		for label, flags in windows do
+			table.insert(parts, id .. "/" .. label .. ":" .. tostring(flags.bar) .. ":" .. tostring(flags.hover))
+		end
+	end
+	table.sort(parts)
+	return table.concat(parts, "\n")
+end
+
+do
+	local monthly = { label = "mo", pct = 70 }
+	local five = { label = "5h", pct = 80 }
+	local group = { key = "codex", id = "codex", label = "Codex", windows = { five, monthly } }
+	local settings: Settings = { mode = "all", selected = {}, colors = {}, order = {}, windows = window_preferences({ codex = { mo = { hover = false } } }) }
+	assert(#visible_windows(settings, group, "bar") == 2)
+	assert(#visible_windows(settings, group, "hover") == 1)
+	settings.windows.codex.mo.bar = false
+	assert(#visible_windows(settings, group, "bar") == 1)
+	assert(#visible_windows(settings, { key = "other", label = "Other", windows = { monthly } }, "hover") == 1)
+	assert(next(window_preferences({ codex = { mo = { hover = "false" } }, invalid = false })) == nil)
+end
 local function load_settings(): Settings
-	local settings: Settings = { mode = "current", selected = id_list(store.get(KV_SELECTED)), colors = {}, order = id_list(store.get(KV_ORDER)) }
+	local settings: Settings = { mode = "current", selected = id_list(store.get(KV_SELECTED)), colors = {}, order = id_list(store.get(KV_ORDER)), windows = window_preferences(store.get(KV_WINDOWS)) }
 	local mode = store.get(KV_MODE)
 	if mode == "all" or mode == "selected" then
 		settings.mode = mode
@@ -786,10 +868,8 @@ local function signature_of(groups: { Group }, others: { string }, title: string
 	return table.concat(parts, "\n")
 end
 
--- What the line shows. By the mode: every provider in the cache, or the chosen ones; or (with neither) the
--- focused agent's: while a subagent's transcript is viewed, the line the cache holds for its model's chip name
--- (an empty one: no usage line), else the status. The status's other parts follow either way, and saved resets
--- come from the cache entry the line came from (the status's model is the chip's).
+-- All/Selected can paint before the new composer's status arrives. Current uses the displayed model's exact
+-- cache entry (including an empty one), not the availability-only native status used to keep the host alive.
 local function build_model(settings: Settings, dock: Dock, cache: Cache?): Model
 	local label, windows, others = parse_line(if dock.status then usage_part(dock.status) else "")
 	local groups: { Group } = {}
@@ -813,9 +893,9 @@ local function build_model(settings: Settings, dock: Dock, cache: Cache?): Model
 		end
 		source = settings.mode
 	end
-	if #groups == 0 then
+	if #groups == 0 and settings.mode ~= "selected" and (settings.mode == "current" or providers == nil) then
 		local entry = if cache and dock.chip then cache.models[dock.chip :: string] else nil
-		if dock.viewing and entry then
+		if entry then
 			label, windows = parse_line(entry.line)
 			source = "model:" .. (dock.chip :: string)
 		else
@@ -844,38 +924,28 @@ local function build_model(settings: Settings, dock: Dock, cache: Cache?): Model
 		others = others,
 		source = source,
 		title = title :: string,
-		signature = signature_of(groups, others, title :: string),
+		signature = signature_of(groups, others, title :: string) .. "\n" .. visibility_key(settings),
 	}
 end
-
--- Each window's share, by provider and window.
-local function shares(model: Model): { [string]: number }
-	local values: { [string]: number } = {}
-	for _, group in model.groups do
-		for _, window in group.windows do
-			values[group.key .. "/" .. window.label] = window.pct
-		end
-	end
-	return values
+do
+	local settings: Settings = { mode = "current", selected = { "openai-codex" }, colors = {}, order = {}, windows = {} }
+	local quota = "Codex 5h ████████ 80% left (2h)"
+	local cache: Cache = {
+		at = 0,
+		models = { Empty = { line = "", resets = {} }, Codex = { line = quota, resets = {} } },
+		providers = { { id = "openai-codex", label = "Codex", line = quota, resets = {} } },
+	}
+	local dock: Dock = { chip = "Empty", status = quota, viewing = false, hide = {} }
+	assert(#build_model(settings, dock, cache).groups == 0)
+	dock.chip, dock.status = "Codex", nil
+	assert(#build_model(settings, dock, cache).groups == 1)
+	dock.chip = nil
+	settings.mode = "all"
+	assert(#build_model(settings, dock, cache).groups == 1)
+	settings.mode = "selected"
+	assert(#build_model(settings, dock, cache).groups == 1)
 end
 
--- The windows whose share moved, and which way (`down`, `up`); nil when none did. Windows on only one side (a
--- provider switched, appeared or went) don't count.
-local function changes(before: { [string]: number }?, after: { [string]: number }): { [string]: string }?
-	if before == nil then
-		return nil
-	end
-	local moved: { [string]: string } = {}
-	local any = false
-	for key, share in after do
-		local old = before[key]
-		if old ~= nil and old ~= share then
-			moved[key] = if share < old then "down" else "up"
-			any = true
-		end
-	end
-	return if any then moved else nil
-end
 
 local function css_string(s: string): string
 	return '"' .. s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", " ") .. '"'
@@ -918,9 +988,6 @@ local function glyph_count(s: string): number
 	return n
 end
 
-local function unbroken(s: string): string
-	return (string.gsub(s, " ", NBSP))
-end
 
 -- A provider's color variables (set on the composer, see `palette_css`) and a window's: its provider's, unless
 -- its share is low.
@@ -942,79 +1009,55 @@ type Paint = { from: number, to: number, color: string }
 type Bar = { at: number, glyphs: number, fill: number, ends: number, key: string, a: string, b: string }
 type Line = { text: string, glyphs: number, paints: { Paint }, bars: { Bar } }
 
--- One provider: `Claude  5H ━━━━━━━━ 98% left  3h 57m · 7D ━━━━━━━━ 71% left  11h 37m  +1 · <other statuses>`.
--- Several (the composer is at most ~115 glyphs wide) go compact, the countdowns and the word `left` left to the
--- card, and a `·` only between providers: `Claude  5H ━━━━━━ 98%  7D ━━━━━━ 71% +1 · Codex  7D ━━━━━━ 79% +2`.
--- Each window's parts are joined by no-break spaces (a provider's label with its first window) so it wraps
--- whole; with them, what colors each part. `compact` overrides the format the number of providers picks.
-local function line_of(model: Model, compact: boolean?): Line
-	local parts: { string } = {}
-	local line: Line = { text = "", glyphs = 0, paints = {}, bars = {} }
-	local several = if compact ~= nil then compact else #model.groups > 1
-	local bar_glyphs = if several then COMPACT_BAR_GLYPHS else BAR_GLYPHS
-	local function add(s: string, color: string?)
-		local n = glyph_count(s)
-		if color then
-			table.insert(line.paints, { from = line.glyphs, to = line.glyphs + n, color = color })
-		end
-		table.insert(parts, s)
-		line.glyphs += n
-	end
-	local function next_part()
-		if line.glyphs > 0 then
-			add(" ") -- a plain space: the only places the line may wrap
-			add("·" .. NBSP, "var(--ou-sep)")
+-- Keep lower-priority blockers visible while preferring 5h, then weekly, then monthly quota.
+local WINDOW_PRIORITY = { ["5h"] = 1, ["7d"] = 2, mo = 3, ["1m"] = 3, ["30d"] = 3 }
+local function inline_windows(windows: { Window }): { Window }
+	local buckets: { [number]: Window } = {}
+	local fallback: Window? = nil
+	for _, window in windows do
+		local rank = WINDOW_PRIORITY[string.match(window.label, "^%S+") or ""]
+		if rank then
+			local before = buckets[rank]
+			if before == nil or window.pct < before.pct then buckets[rank] = window end
+		elseif fallback == nil or window.pct < fallback.pct then
+			fallback = window
 		end
 	end
-	for g, group in model.groups do
-		for w, window in group.windows do
-			local tone = tone_of(window.pct)
-			if w > 1 and several then
-				add(" " .. NBSP)
-			else
-				next_part()
-			end
-			if w == 1 and group.label ~= "" then
-				add(group.label, group_color(g, "a"))
-				add(NBSP .. NBSP)
-			end
-			add(string.upper(window.label), "var(--ou-lbl)")
-			add(NBSP)
-			local at = line.glyphs
-			add(string.rep(BAR, bar_glyphs))
-			add(NBSP)
-			add(tostring(window.pct) .. "%", "var(--ou-num-" .. tone .. ")")
-			if not several then
-				add(NBSP .. "left", "var(--ou-dim)")
-				if window.reset then
-					add(NBSP .. NBSP .. unbroken(window.reset :: string), "var(--ou-soft)")
-				end
-			end
-			if window.saved then
-				local saved = "+" .. tostring(window.saved)
-				if window.expires then
-					saved ..= if several then "!" else NBSP .. "exp" .. NBSP .. unbroken(window.expires :: string)
-				end
-				add((if several then NBSP else NBSP .. NBSP) .. saved, if window.expires then "var(--ou-num-warn)" else group_color(g, "a"))
-			end
-			local a, b = window_colors(tone, g)
-			table.insert(line.bars, {
-				at = at,
-				glyphs = bar_glyphs,
-				fill = math.clamp(window.pct, 0, 100) / 100 * bar_glyphs,
-				ends = line.glyphs,
-				key = group.key .. "/" .. window.label,
-				a = a,
-				b = b,
-			})
+	local selected: { Window } = {}
+	local exhausted = true
+	for rank = 1, 3 do
+		local window = buckets[rank]
+		if window and (exhausted or window.pct <= 0) then
+			table.insert(selected, window)
+			exhausted = exhausted and window.pct <= 0
 		end
 	end
-	for _, other in model.others do
-		next_part()
-		add(unbroken(other), "var(--ou-soft)")
-	end
-	line.text = table.concat(parts)
-	return line
+	return if #selected > 0 then selected elseif fallback then { fallback } else {}
+end
+
+do
+	local five = { label = "5h Gemini", pct = 80 }
+	local weekly = { label = "7d Gemini", pct = 40 }
+	local monthly = { label = "mo", pct = 65 }
+	assert(inline_windows({ monthly, weekly, five })[1] == five)
+	weekly.pct = 0
+	local blocked_week = inline_windows({ five, weekly, monthly })
+	assert(#blocked_week == 2 and blocked_week[1] == five and blocked_week[2] == weekly)
+	five.pct, weekly.pct = 0, 40
+	local blocked_five = inline_windows({ monthly, weekly, five })
+	assert(#blocked_five == 2 and blocked_five[1] == five and blocked_five[2] == weekly)
+	weekly.pct = 0
+	local blocked_both = inline_windows({ monthly, weekly, five })
+	assert(#blocked_both == 3 and blocked_both[3] == monthly)
+	assert(inline_windows({ monthly })[1] == monthly)
+	local tighter = { label = "5h Claude & GPT", pct = 20 }
+	assert(inline_windows({ tighter, { label = "5h Gemini", pct = 90 }, monthly })[1] == tighter)
+	assert(#inline_windows({}) == 0)
+	local scoped, provider = parse_window("Antigravity 5h Gemini Pro ████░░░░ 50% left (2h)")
+	assert(scoped and scoped.label == "5h Gemini Pro" and scoped.pct == 50 and provider == "Antigravity")
+	local month = parse_window("Cursor mo Other Models ████████ 80% left")
+	assert(month and month.label == "mo Other Models")
+	assert(parse_window("ponytail: FULL") == nil)
 end
 
 -- The text's paint: each part's color over its glyphs; each bar from its first color, faint, to its second up to
@@ -1049,12 +1092,6 @@ local function line_paint(line: Line): string
 	return "linear-gradient(90deg, " .. table.concat(stops, ", ") .. ")"
 end
 
--- `size` while the bar's window fits on the line of the box drawing it, else 0, so a window that wrapped away
--- takes its tip along (in background sizes, 100% is that box's width).
-local function fits(bar: Bar, size: number): string
-	return string.format("clamp(0px, calc((100%% - %spx) * 1000), %spx)", num(bar.ends * GLYPH - 3), num(size))
-end
-
 local function tip_image(color: string, strength: number): string
 	return string.format(
 		"radial-gradient(closest-side, color-mix(in srgb, %s 45%%, white), rgb(from %s r g b / %d%%) 45%%, rgb(from %s r g b / 0%%))",
@@ -1065,27 +1102,8 @@ local function tip_image(color: string, strength: number): string
 	)
 end
 
-local function trail_image(color: string): string
-	return string.format("linear-gradient(90deg, rgb(from %s r g b / 0%%), rgb(from %s r g b / 80%%))", color, color)
-end
-
-type Layers = { images: { string }, positions: { string }, sizes: { string } }
-
--- Each bar's lit tip, where its window stands.
-local function tips(line: Line, strength: number): Layers
-	local layers: Layers = { images = {}, positions = {}, sizes = {} }
-	for _, bar in line.bars do
-		local x = (bar.at + bar.fill) * GLYPH
-		table.insert(layers.images, tip_image(bar.b, strength))
-		table.insert(layers.positions, string.format("%spx %spx", num(x - TIP_W / 2), num(BAR_Y - TIP_H / 2)))
-		table.insert(layers.sizes, string.format("%s %spx", fits(bar, TIP_W), num(TIP_H)))
-	end
-	return layers
-end
-
--- The hover target: the composer's empty chips row (see the header), laid over the usage line.
-local HOST = "%s.sf-col[data-role^='omp.editor'] > .sf-row[data-role='omp.composer.chips']:is(.sf-hidden, .sf-void)"
-local METER = ".tn-pane.on .sf-meter[data-role='omp.composer.context']"
+-- The quota item owns its hit target; the separate native cost control and its tooltip are untouched.
+local HOST = "%s.sf-col[data-role^='omp.editor']:not(.sf-unfocused) > .sf-row[data-role='omp.composer.bar'] > .sf-act[data-role='omp.composer.provider-usage']"
 
 -- The target in the focused pane; `region` narrows it by a class of the surface region (`.sf-chat-reader`,
 -- `.sf-still`), which sits between the pane and the composer.
@@ -1093,207 +1111,23 @@ local function host(region: string?): string
 	return ".tn-pane.on " .. string.format(HOST, if region then region .. " " else "")
 end
 
--- The providers' colors as variables on the composer, which the line, its tips, the capsule and the card all
--- sit in; the capsule's ring and the card's glow follow the line's one provider (with several, the theme's), and
--- the ring turns `--warn` or `--bad` with the lowest window.
+-- Provider colors apply to the quota icons and meters; the hover surface uses Tern's own theme tokens.
 local function palette_css(model: Model, settings: Settings): string
 	local lines: { string } = {}
-	local lowest: number? = nil
 	for g, group in model.groups do
 		local palette = palette_for(settings, group.id, group.label)
 		table.insert(lines, string.format("\t--ou-g%d-a: %s;", g, palette.a))
 		table.insert(lines, string.format("\t--ou-g%d-b: %s;", g, palette.b or palette.a))
-		for _, window in group.windows do
-			lowest = if lowest == nil then window.pct else math.min(lowest :: number, window.pct)
-		end
 	end
-	local low = if lowest then tone_of(lowest) else "ok"
-	local one = #model.groups == 1
-	local ring = if low == "warn"
-		then faded("var(--warn)", 45)
-		elseif low == "bad" then faded("var(--bad)", 50)
-		elseif one then faded(group_color(1, "a"), 40)
-		else "var(--l2)"
-	table.insert(lines, "\t--ou-ring: " .. ring .. ";")
-	table.insert(lines, "\t--ou-glow: " .. (if one then group_color(1, "a") else "var(--accent)") .. ";")
-	-- Tern's popover glass is translucent and counts on a backdrop blur, which doesn't take on the card, so text
-	-- behind it would show through: the capsule and card take the glass's color (the card's, in light) opaque
-	table.insert(lines, "\t--ou-glass: light-dark(rgb(from var(--card) r g b / 1), rgb(from var(--pop-bg) r g b / 1));")
-	return ".tn-pane.on .sf-col[data-role^='omp.editor'] {\n" .. table.concat(lines, "\n") .. "\n}"
+	return ".tn-pane.on .sf-col[data-role^='omp.editor']:not(.sf-unfocused) {\n" .. table.concat(lines, "\n") .. "\n}"
 end
 
--- The line twice: on the meter at rest, and on the hover target over it, at full strength. The target's two
--- pseudo-elements are all a hover can change: Tern restyles the hovered element and its own parts, not its
--- siblings (`:hover +` never updates there), and the line lives on the meter, which comes before the target. So
--- the target's box is the capsule, its `::before` the bright copy, glyph for glyph over the line, and its
--- `::after` the card.
-local LINE_CSS = [==[
-/* room above the hairline for the usage line, clear of the working row; every agent pane, so focus never shifts it */
-.sf-dock .sf-col[data-role^='omp.editor'] {
-	margin-top: 15px;
-}
-/* the providers' colors */
-$PALETTE
-/* the line: 10px mono in a 13px box whose second line (where a window that doesn't fit wraps) is cut off; one
-   static gradient clipped to the text colors its parts and fills its bars */
-$METER::before,
-$HOST::before {
-	content: $CONTENT;
-	height: 13px;
-	overflow: hidden;
-	white-space: pre-wrap;
-	text-overflow: ellipsis;
-	font: 500 10px/15px var(--mono);
-	font-variant-numeric: tabular-nums;
-	color: transparent;
-	background-image: $PAINT;
-	background-repeat: no-repeat;
-	background-clip: text;
-	pointer-events: none;
-	--ou-lbl: var(--t3);
-	--ou-sep: var(--t4);
-	--ou-num-ok: var(--t2);
-	--ou-num-warn: var(--warn);
-	--ou-num-bad: var(--bad);
-	--ou-dim: var(--t4);
-	--ou-soft: var(--t3);
-	--ou-track: color-mix(in srgb, var(--t1) 13%, transparent);
-}
-/* the text is the focused agent's, so it shows on the focused pane only */
-$METER::before {
-	position: absolute;
-	left: 0;
-	right: 0;
-	bottom: 100%;
-	margin-bottom: 2px;
-}
-$TIPS_CSS
-/* the hover target over the line: the meter's place in each chat style, widened by the capsule's 6px pad, as
-   long as the line (or the meter, if that's shorter) */
-$HOST {
-	display: block !important;
-	position: absolute;
-	left: 12px;
-	top: -28px;
-	width: min($WIDTH, calc(100% - 24px));
-	height: 15px;
-	min-height: 0;
-	margin: 0;
-	padding: 0;
-	overflow: visible;
-	opacity: 1;
-	z-index: 5;
-	pointer-events: auto;
-	border-radius: 8px;
-	background-color: transparent;
-	box-shadow: 0 0 0 1px transparent, 0 8px 20px -12px transparent, inset 0 1px 0 transparent;
-	transition:
-		background-color 0.2s var(--ease),
-		box-shadow 0.2s var(--ease);
-}
-$HOST_READER {
-	left: 16px;
-	width: min($WIDTH, calc(100% - 32px));
-}
-$HOST_SPINE {
-	left: -6px;
-	width: min($WIDTH, calc(100% - 4px));
-}
-$HOST_CONSOLE {
-	left: calc(max(0px, (100% - 1040px) / 2) + var(--cn-gut) - 12px);
-	width: min($WIDTH, calc(min(100%, 1040px) - var(--cn-gut) + 12px));
-}
-/* hovered, the line lifts into a glass capsule, ringed in its provider's color (or the lowest window's tone) */
-$HOST:hover {
-	background-color: var(--ou-glass);
-	box-shadow:
-		0 0 0 1px var(--ou-ring),
-		0 8px 20px -12px light-dark(rgba(0, 0, 0, 0.28), rgba(0, 0, 0, 0.8)),
-		inset 0 1px 0 var(--glass-hi);
-}
-/* and comes up to full strength: the copy fades in over it, the capsule hiding the line beneath */
-$HOST::before {
-	position: absolute;
-	left: 6px;
-	right: 6px;
-	top: 1px;
-	background-image: $PAINT$HOVER_IMAGES;
-	background-position: 0 0$HOVER_POSITIONS;
-	background-size: auto$HOVER_SIZES;
-	background-clip: text$HOVER_CLIPS;
-	opacity: 0;
-	transition: opacity 0.2s var(--ease);
-	--ou-lbl: var(--t2);
-	--ou-sep: var(--t3);
-	--ou-num-ok: var(--t1);
-	--ou-dim: var(--t3);
-	--ou-soft: var(--t2);
-	--ou-track: color-mix(in srgb, var(--t1) 20%, transparent);
-}
-$HOST:hover::before {
-	opacity: 1;
-}
-]==]
-
--- The tips at rest, on the meter's `::after`, which a change's comets take over (pulse_css).
-local TIPS_CSS = [==[
-/* each bar's lit tip, where its window stands */
-$METER::after {
-	content: "";
-	position: absolute;
-	left: 0;
-	right: 0;
-	bottom: 100%;
-	margin-bottom: 2px;
-	height: 13px;
-	background-image: $IMAGES;
-	background-position: $POSITIONS;
-	background-size: $SIZES;
-	background-repeat: no-repeat;
-	pointer-events: none;
-}]==]
-
-local function line_css(line: Line, model: Model, settings: Settings): string
-	local paint = line_paint(line)
-	local rest = tips(line, 55)
-	local lit = tips(line, 70)
-	local function more(list: { string }): string
-		return if #list > 0 then ", " .. table.concat(list, ", ") else ""
-	end
-	local clips: { string } = {}
-	for _ in lit.images do
-		table.insert(clips, "border-box")
-	end
-	return fill(LINE_CSS, {
-		METER = METER,
-		HOST = host(nil),
-		HOST_READER = host(".sf-chat-reader"),
-		HOST_SPINE = host(".sf-chat-spine"),
-		HOST_CONSOLE = host(".sf-chat-console"),
-		PALETTE = palette_css(model, settings),
-		CONTENT = css_string(line.text),
-		PAINT = paint,
-		TIPS_CSS = if #rest.images > 0
-			then fill(TIPS_CSS, {
-				METER = METER,
-				IMAGES = table.concat(rest.images, ", "),
-				POSITIONS = table.concat(rest.positions, ", "),
-				SIZES = table.concat(rest.sizes, ", "),
-			})
-			else "",
-		WIDTH = num(line.glyphs * GLYPH + 12) .. "px",
-		HOVER_IMAGES = more(lit.images),
-		HOVER_POSITIONS = more(lit.positions),
-		HOVER_SIZES = more(lit.sizes),
-		HOVER_CLIPS = more(clips),
-	})
-end
 
 -- The card's rows for a model (the first is the title): clock times are worked out when a model first shows, so
 -- they don't drift with every poll between the extension's 60s refreshes. With several providers each gets a
 -- row of its label in its color. A saved reset's row (its expiry date, from the cache) sits under the window
 -- that counts it (`+N`); without dates the line's count stands in. `hint`, last, says how to open the settings.
-local function card(model: Model, hint: string): { Row }
+local function card(model: Model, hint: string, settings: Settings): { Row }
 	local key = model.signature .. "\n" .. hint
 	if key == card_for then
 		return card_rows
@@ -1302,20 +1136,22 @@ local function card(model: Model, hint: string): { Row }
 	local rows: { Row } = { { text = model.title, color = "var(--oc-head)" } }
 	local several = #model.groups > 1
 	for g, group in model.groups do
-		local accent = group_color(g, "a")
+		local windows = visible_windows(settings, group, "hover")
+		if #windows == 0 then continue end
+		local accent = "var(--oc-head)"
 		if several then
 			table.insert(rows, { text = group.label, color = accent })
 		end
 		local resets = group.resets or {}
 		local carrier: number? = nil
-		for w, window in group.windows do
+		for w, window in windows do
 			if window.saved then
 				carrier = w
 			end
 		end
 		if carrier == nil and #resets > 0 then
-			for w, window in group.windows do
-				if window.label == "7d" then
+			for w, window in windows do
+				if string.match(window.label, "^%S+") == "7d" then
 					carrier = w
 				end
 			end
@@ -1331,7 +1167,7 @@ local function card(model: Model, hint: string): { Row }
 				end
 			end
 		end
-		for w, window in group.windows do
+		for w, window in windows do
 			local tone = tone_of(window.pct)
 			local a, b = window_colors(tone, g)
 			table.insert(rows, {
@@ -1368,9 +1204,6 @@ local function card(model: Model, hint: string): { Row }
 				})
 			end
 		end
-		if carrier == nil then
-			add_resets()
-		end
 	end
 	for _, other in model.others do
 		table.insert(rows, { text = other, color = "var(--oc-soft)" })
@@ -1382,20 +1215,21 @@ local function card(model: Model, hint: string): { Row }
 end
 
 local CARD_CSS = [==[
-/* the card: the line's facts spelled out over it, a row each, in a glass panel with a title bar; one gradient,
-   row by row, colors the text, and each window's row sits on a meter with a lit tip */
-$HOST:hover::after {
+/* Native-theme popover surface; meters and text retain the quota detail layout. */
+$HOST:hover::before {
 	content: "$CONTENT";
 	position: absolute;
-	left: 0;
+	right: 0;
 	bottom: calc(100% + 8px);
+	z-index: 6;
 	padding: 5px 12px 9px;
-	border-radius: 12px;
+	border-radius: var(--r-card);
 	white-space: pre;
-	font: 500 11px/18px var(--mono);
+	font: 400 11px/18px var(--mono);
 	font-variant-numeric: tabular-nums;
 	color: transparent;
-	background-color: var(--ou-glass);
+	/* Pseudo-element blur is unreliable; use the theme's popover color without transcript bleed-through. */
+	background-color: rgb(from var(--pop-bg) r g b / 1);
 	background-image: $IMAGES;
 	background-position: $POSITIONS;
 	background-size: $SIZES;
@@ -1404,8 +1238,7 @@ $HOST:hover::after {
 	background-clip: $CLIPS;
 	box-shadow:
 		0 0 0 1px var(--l2),
-		0 22px 44px -18px light-dark(rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.85)),
-		0 6px 14px -8px light-dark(rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.55)),
+		0 8px 24px light-dark(rgb(0 0 0 / 12%), rgb(0 0 0 / 28%)),
 		inset 0 1px 0 var(--glass-hi);
 	pointer-events: none;
 	transform-origin: 16px 100%;
@@ -1421,7 +1254,7 @@ $HOST:hover::after {
 	--oc-soft: var(--t2);
 	--oc-warn: var(--warn);
 	--oc-track: color-mix(in srgb, var(--t1) 10%, transparent);
-	--oc-hint: light-dark(var(--t3), color-mix(in srgb, var(--t3) 60%, var(--t4)));
+	--oc-hint: var(--t3);
 }
 @keyframes omp-usage-card {
 	from { opacity: 0; transform: translateY(5px) scale(0.97); }
@@ -1505,30 +1338,6 @@ local function card_css(rows: { Row }): string
 		table.insert(paint, string.format("%s %spx %spx", solid(row.color), num(y), num(y + CARD_ROW)))
 	end
 	images[1] = "linear-gradient(180deg, " .. table.concat(paint, ", ") .. ")"
-	-- the title bar: a lighter band down to a hairline under the title, and a glow of the provider's color (with
-	-- several, the theme accent) from its corner
-	local band = string.format("%spx", num(5 + CARD_ROW - 1))
-	layer(
-		string.format("linear-gradient(90deg, %s, %s)", solid("var(--l3)"), solid("var(--l1)")),
-		"0 " .. band,
-		"100% 1px",
-		"100% 1px",
-		"padding-box"
-	)
-	layer(
-		string.format("linear-gradient(%s, %s)", solid("var(--l1)"), solid("var(--l1)")),
-		"0 0",
-		"100% " .. band,
-		"100% " .. band,
-		"padding-box"
-	)
-	layer(
-		string.format("radial-gradient(130%% 150%% at 0%% 0%%, %s, transparent 60%%)", faded("var(--ou-glow)", 14)),
-		"0 0",
-		"100% 100%",
-		"100% 100%",
-		"padding-box"
-	)
 	return fill(CARD_CSS, {
 		HOST = host(nil),
 		CONTENT = table.concat(lines, "\\A "),
@@ -1541,142 +1350,78 @@ local function card_css(rows: { Row }): string
 	})
 end
 
-local STILL_CSS = fill(
-	[==[
-/* Reduce Motion, either way: no fades, no rise, no fill, no change sweep; the card still waits its beat, then
-   shows at once */
-$HOST_STILL,
-$HOST_STILL::before {
-	transition: none;
+local PROVIDER_ICONS: { [string]: string } = {
+	["openai-codex"] = "󰚩", openai = "󰚩", anthropic = "✽",
+	["google-antigravity"] = "✦", ["google-gemini-cli"] = "✦",
+	cursor = "", ["github-copilot"] = "",
 }
-$HOST_STILL:hover::after {
-	animation: omp-usage-card-still 0s 0.35s both !important;
-}
-.tn-pane.on .sf-still .sf-meter[data-role='omp.composer.context']::before,
-.tn-pane.on .sf-still .sf-meter[data-role='omp.composer.context']::after {
-	animation: none !important;
-}
-@media (prefers-reduced-motion: reduce) {
-	$HOST,
-	$HOST::before {
-		transition: none;
-	}
-	$HOST:hover::after {
-		animation: omp-usage-card-still 0s 0.35s both !important;
-	}
-	$METER::before,
-	$METER::after {
-		animation: none !important;
-	}
-}
-@keyframes omp-usage-card-still {
-	from { opacity: 0; }
-	to { opacity: 1; }
-}
-]==],
-	{ HOST = host(nil), HOST_STILL = host(".sf-still"), METER = METER }
-)
 
-local PULSE_CSS = [==[
-/* the change: the line prints again, left to right, while a comet runs each changed bar to its new level,
-   flares and settles into its tip */
-$METER::before {
-	-stencil-text-effect: reveal;
-	-stencil-text-offset: 0 3px;
-	-stencil-text-blur: 2px;
-	-stencil-text-stagger: 0.008;
-	animation: $REVEAL 700ms var(--out) 1 both;
-}
-$METER::after {
-	animation: $RUN $DURATION linear 1 both;
-}
-@keyframes $REVEAL {
-	from { -stencil-progress: 0; }
-	to { -stencil-progress: 1; }
-}
-@keyframes $RUN {
-$FRAMES
-}
-]==]
-
-local function eased(u: number): number
-	return if u < 0.5 then 4 * u * u * u else 1 - ((2 - 2 * u) ^ 3) / 2
+local function quota_label(group: Group, settings: Settings): (string?, number)
+	local values: { string } = {}
+	local lowest = 100
+	for _, window in inline_windows(visible_windows(settings, group, "bar")) do
+		table.insert(values, tostring(window.pct))
+		lowest = math.min(lowest, window.pct)
+	end
+	return if #values > 0 then (PROVIDER_ICONS[group.id or ""] or "◈") .. NBSP .. table.concat(values, "/") .. "%" else nil, lowest
 end
-
--- The comets, as keyframes over the tips' layers (a head and a trail per bar; a bar that didn't move keeps its
--- tip): the head appears at the bar's start, runs to the share, flares and shrinks into the tip, the trail behind
--- it; in the bar's color when quota went down, `--ok` when it came back.
-local function pulse_css(line: Line, p: Pulse): string
-	local frames: { string } = {}
-	for _, at in RUN_STOPS do
-		local images: { string } = {}
-		local positions: { string } = {}
-		local sizes: { string } = {}
-		for _, bar in line.bars do
-			local from = bar.at * GLYPH
-			local to = (bar.at + bar.fill) * GLYPH
-			local x, w, h, trail, ink, strength = to, TIP_W, TIP_H, 0, bar.b, 55
-			local way = p.moved[bar.key]
-			if way then
-				local u = if at <= RUN_SET then 0 elseif at >= RUN_ARRIVE then 1 else (at - RUN_SET) / (RUN_ARRIVE - RUN_SET)
-				x = from + (to - from) * eased(u)
-				if at <= RUN_SET then
-					w, h = HEAD_W * at / RUN_SET, HEAD_H * at / RUN_SET
-				elseif at <= RUN_ARRIVE then
-					w, h = HEAD_W, HEAD_H
-				elseif at <= RUN_FLARE then
-					local k = 1 + 0.3 * (at - RUN_ARRIVE) / (RUN_FLARE - RUN_ARRIVE)
-					w, h = HEAD_W * k, HEAD_H * k
-				else
-					local k = (at - RUN_FLARE) / (1 - RUN_FLARE)
-					w = HEAD_W * 1.3 + (TIP_W - HEAD_W * 1.3) * k
-					h = HEAD_H * 1.3 + (TIP_H - HEAD_H * 1.3) * k
-				end
-				trail = math.min(TRAIL_W, x - from)
-				if at > RUN_ARRIVE then
-					trail *= math.max(0, 1 - (at - RUN_ARRIVE) / (RUN_FLARE - RUN_ARRIVE))
-				end
-				ink = if at < 0.9 and way == "up" then PULSE_UP else bar.b
-				strength = 80
-			end
-			table.insert(images, tip_image(ink, strength))
-			table.insert(images, trail_image(ink))
-			table.insert(positions, string.format("%spx %spx", num(x - w / 2), num(BAR_Y - h / 2)))
-			table.insert(positions, string.format("%spx %spx", num(x - trail), num(BAR_Y - TRAIL_H / 2)))
-			table.insert(sizes, string.format("%s %spx", fits(bar, w), num(h)))
-			table.insert(sizes, string.format("%s %spx", fits(bar, trail), num(TRAIL_H)))
-		end
-		table.insert(
-			frames,
-			string.format(
-				"\t%s%% { background-image: %s; background-position: %s; background-size: %s; }",
-				num(at * 100),
-				table.concat(images, ", "),
-				table.concat(positions, ", "),
-				table.concat(sizes, ", ")
-			)
-		)
+do
+	local flags = { hover = false }
+	local settings: Settings = { mode = "all", selected = {}, colors = {}, order = {}, windows = { probe = { mo = flags } } }
+	local report: Cache = { at = 0, models = {}, providers = { { id = "probe", label = "Probe", line = "Probe mo ███░░░░░ 37% left", resets = {} } } }
+	local function displayed(rows: { Row }): { number }
+		local values: { number } = {}
+		for _, row in rows do if row.share ~= nil then table.insert(values, row.share) end end
+		return values
 	end
-	return fill(PULSE_CSS, {
-		METER = METER,
-		REVEAL = "omp-usage-reveal-" .. tostring(p.seq), -- a new name per change restarts the animation
-		RUN = "omp-usage-run-" .. tostring(p.seq),
-		DURATION = tostring(PULSE_MS) .. "ms",
-		FRAMES = table.concat(frames, "\n"),
-	})
+	local dock: Dock = { viewing = false, hide = {} }
+	local model = build_model(settings, dock, report)
+	local _, remaining = quota_label(model.groups[1], settings)
+	assert(remaining == 37 and #displayed(card(model, "", settings)) == 0)
+	flags.hover, flags.bar = true, false
+	model = build_model(settings, dock, report)
+	assert(quota_label(model.groups[1], settings) == nil)
+	assert(displayed(card(model, "", settings))[1] == 0.37)
+	settings.windows.probe.mo.hover = false
+	assert(not window_enabled(settings, "probe", "mo Other Models", "hover"))
+	settings.windows.probe["mo Other Models"] = { hover = true }
+	assert(window_enabled(settings, "probe", "mo Other Models", "hover"))
 end
-
-local function sheet(model: Model, settings: Settings, p: Pulse?, hint: string): string
-	if #model.groups == 0 and #model.others == 0 then
-		return ""
+local function sheet(model: Model, settings: Settings): string
+	if #model.groups == 0 then return "" end
+	local parts: { string } = {}
+	local line: Line = { text = "", glyphs = 0, paints = {}, bars = {} }
+	for _, group in model.groups do
+		local piece, lowest = quota_label(group, settings)
+		if piece == nil then continue end
+		if #parts > 0 then line.glyphs += 2 end
+		local tone = tone_of(lowest)
+		local palette = palette_for(settings, group.id, group.label)
+		table.insert(line.paints, { from = line.glyphs, to = line.glyphs + glyph_count(piece), color = if tone == "bad" then "var(--bad)" elseif tone == "warn" then "var(--warn)" else palette.a })
+		line.glyphs += glyph_count(piece)
+		table.insert(parts, piece)
 	end
-	local line = line_of(model)
-	local css = line_css(line, model, settings) .. card_css(card(model, hint)) .. STILL_CSS
-	-- Only while it runs: a sheet rewritten later (a countdown tick) must not replay it.
-	if p and #line.bars > 0 and tern.now() < p.until_ms then
-		css ..= pulse_css(line, p)
-	end
-	return css
+	if #parts == 0 then return "" end
+	return palette_css(model, settings) .. host(nil) .. [[ {
+		position: relative !important;
+		display: flex !important;
+		align-items: center;
+		gap: 4px;
+		flex-shrink: 0;
+		padding: 0 2px 0 8px;
+		font-size: 0;
+		overflow: visible !important;
+	}
+	]] .. host(nil) .. "::after {\n\tcontent: " .. css_string(table.concat(parts, NBSP .. NBSP)) .. ";\n\tbackground-image: " .. line_paint(line) .. [[;
+		position: static;
+		font: 500 9px/1 var(--mono);
+		font-variant-numeric: tabular-nums;
+		pointer-events: none;
+		color: transparent;
+		background-clip: text;
+		white-space: nowrap;
+		min-width: 0;
+	}]] .. card_css(card(model, "click · Usage overview", settings))
 end
 
 -- Hides the status facts the line redraws from the focused pane's bar, by their exact ids: `hook-N` numbers
@@ -1687,7 +1432,7 @@ local function hide_css(ids: { string }): string
 	end
 	local selectors: { string } = {}
 	for _, id in ids do
-		table.insert(selectors, ".tn-pane.on [data-role='omp.composer.bar'] [data-id=" .. css_string(id) .. "]")
+		table.insert(selectors, ".tn-pane.on .sf-col[data-role^='omp.editor']:not(.sf-unfocused) [data-role='omp.composer.bar'] [data-id=" .. css_string(id) .. "]")
 	end
 	return table.concat(selectors, ",\n") .. " {\n\tdisplay: none !important;\n}\n"
 end
@@ -1699,13 +1444,12 @@ local function install(css: string)
 	end
 end
 
--- The settings panel's action (the `panel` command) and its default shortcut.
+-- Command-palette settings; users may bind the command themselves in Tern.
 local PANEL_ACTION = "plugin." .. tern.plugin.id .. ".panel"
-local PANEL_KEYS = "ctrl+alt+u"
 -- The panel's pane while it is open, and what redraws it (see the panel section); the dock last read, which
 -- the panel's preview of the line is drawn from.
 local panel_pane: number? = nil
-local sync_panel: (cx: WindowCx, force: boolean, settings: Settings?, cache: Cache?) -> ()
+local sync_panel: (cx: WindowCx, force: boolean, settings: Settings?, cache: Cache?, immediate: boolean?) -> ()
 local last_dock: Dock? = nil
 
 -- A chord as the keymap spells it (`ctrl+alt+u`) for people (`Ctrl+Alt+U`); a sequence's steps are spaced.
@@ -1752,12 +1496,7 @@ local function shortcut(cx: WindowCx): string?
 	return shortcut_text
 end
 
--- The card's last row: how to open the settings.
-local function settings_hint(cx: WindowCx): string
-	return "settings · " .. (shortcut(cx) or "omp Usage in the palette")
-end
 
-local refresh: (cx: WindowCx) -> ()
 -- What the installed sheet was built from (see `show_pane`).
 local sheet_key: string? = nil
 
@@ -1777,39 +1516,15 @@ end
 
 -- Draws the line of an agent pane's composer. Most polls change nothing it draws, and then the sheet isn't built
 -- again: a slow call trips the window's 50 ms budget, which turns off every timer of the plugin until a reload.
-local function show_pane(cx: WindowCx, pane: number, settings: Settings, cache: Cache?)
-	local dock = read_dock(cx, pane)
+local function show_pane(pane: number, settings: Settings, cache: Cache?, dock: Dock)
 	local model = build_model(settings, dock, cache)
-	local values = shares(model)
-	if pane ~= shown_pane then
-		shown_pane = pane
-		pulse = nil -- another pane's line: nothing changed, it is only shown
-	else
-		-- Another source (a mode, a viewed subagent's model, the status) shows other numbers, not a change in these.
-		local before = last_seen[pane]
-		local moved = if before and before.source == model.source then changes(before.values, values) else nil
-		if moved then
-			pulse_seq += 1 -- a new keyframes name restarts the animation
-			pulse = { seq = pulse_seq, until_ms = tern.now() + PULSE_MS, moved = moved }
-			-- drop the animation once it has run, so later rewrites don't carry it
-			tern.timer(PULSE_MS + 50, function(later: WindowCx?)
-				if later then
-					refresh(later)
-				end
-			end)
-		elseif before == nil or before.source ~= model.source then
-			pulse = nil
-		end
-	end
-	last_seen[pane] = { source = model.source, values = values }
+	shown_pane = pane
 	last_dock = dock
-	local hint = settings_hint(cx)
-	local running = if pulse and tern.now() < pulse.until_ms then pulse.seq else 0
 	local hidden = table.concat(dock.hide, "\n")
-	local key = table.concat({ model.signature, colors_key(settings), hint, tostring(running), hidden }, "\n")
+	local key = table.concat({ model.signature, colors_key(settings), hidden }, "\n")
 	if key ~= sheet_key then
 		sheet_key = key
-		install(hide_css(dock.hide) .. sheet(model, settings, pulse, hint))
+		install(hide_css(dock.hide) .. sheet(model, settings))
 	end
 end
 
@@ -1828,50 +1543,85 @@ local function some_agent(cx: WindowCx, tab: number?): number?
 	return found
 end
 
--- Shows the focused agent's usage; a focused non-agent pane keeps the last line (no composer shows it there),
--- but while the settings panel has focus the line it last showed follows the settings, for the panel's preview.
--- Then redraws the panel if what it shows changed.
+local active_pane: number? = nil
+local docks: { [number]: Dock } = {}
+local render_pending = false
+local dock_timer: TimerHandle? = nil
+
+local function queue_render()
+	if render_pending then return end
+	render_pending = true
+	tern.timer(0, function(cx: WindowCx?)
+		render_pending = false
+		if cx == nil then return end
+		local settings = load_settings()
+		local cache = read_cache(now_ms())
+		local pane = active_pane
+		if pane then
+			show_pane(pane, settings, cache, docks[pane] or { viewing = false, hide = {} })
+		end
+		if panel_pane then
+			tern.timer(0, function(later: WindowCx?)
+				if later then sync_panel(later, false) end
+			end)
+		end
+	end)
+end
+
+-- Surface reads are synchronous in Tern 0.9.5. Never combine this IPC with focus, cache completion or painting.
+local function observe_dock(cx: WindowCx?)
+	dock_timer = nil
+	local pane = active_pane
+	if cx == nil or pane == nil then return end
+	dock_timer = tern.timer(DOCK_POLL_MS, observe_dock)
+	local had_root = bar_roots[pane] ~= nil
+	local dock = read_dock(cx, pane)
+	if dock then
+		docks[pane] = dock
+		queue_render()
+	elseif not had_root and bar_roots[pane] then
+		dock_timer:cancel()
+		dock_timer = tern.timer(0, observe_dock)
+	end
+end
+
 refresh = function(cx: WindowCx)
 	local target: number? = nil
 	local pane = cx.session:focused()
 	if pane ~= nil then
 		local info = cx.session:pane(pane)
-		if info and info.kind == "agent" then
-			target = pane
-		elseif info and pane == panel_pane then
-			target = shown_pane or some_agent(cx, info.tab)
-		end
+		if info and info.kind == "agent" then target = pane end
 	end
-	if target == nil and panel_pane == nil then
-		return
+	local changed = target ~= active_pane
+	active_pane = target
+	-- Paint cached All/Selected data before asking the new session for any dock.
+	if target ~= nil or panel_pane ~= nil then queue_render() end
+	if changed and dock_timer then
+		dock_timer:cancel()
+		dock_timer = nil
 	end
-	local settings = load_settings()
-	local cache = read_cache(now_ms())
-	if target ~= nil then
-		show_pane(cx, target :: number, settings, cache)
-	end
-	if panel_pane ~= nil then
-		sync_panel(cx, false, settings, cache)
+	if target ~= nil and dock_timer == nil then
+		dock_timer = tern.timer(0, observe_dock)
 	end
 end
 
-local function tick(cx: WindowCx?)
-	if cx then
-		refresh(cx)
-	end
+local function tick(_cx: WindowCx?)
 	tern.timer(POLL_MS, tick)
+	request_refresh()
 end
 
 tern.on("focus", function(_ev: FocusEvent, cx: WindowCx)
 	refresh(cx)
 end)
+tern.on("window_start", function(cx: WindowCx)
+	refresh(cx)
+end)
+tern.on("pane_created", function(_ev: PaneEvent, _cx: WindowCx)
+	request_refresh()
+end)
+tern.timer(0, tick)
 
--- the first poll waits out the reload's own work
-tern.timer(300, tick)
-
--- Settings, two ways: the panel (a canvas beside the focused pane: the `omp Usage: Settings panel` command,
--- Ctrl+Alt+U, or `usage` in the status bar) and pickers (`omp Usage: Settings…`). Both store what is chosen in
--- `tern.kv` and redraw the line at once; the menus and the panel are built by the plain functions below.
+-- Settings use the command-palette panel or quick-option pickers; both persist through tern.kv.
 
 -- The providers on offer, in the user's order.
 local function providers_in_order(settings: Settings): { Provider }
@@ -2080,8 +1830,14 @@ local function move_provider(id: string, how: string)
 end
 
 local function after_change(cx: WindowCx?)
-	if cx then
-		refresh(cx)
+	if cx == nil then return end
+	local settings = load_settings()
+	local cache = read_cache(now_ms())
+	-- Settings feedback must not wait for a timer or another agent-surface round trip.
+	sync_panel(cx, true, settings, cache, true)
+	sheet_key = nil
+	if shown_pane and last_dock then
+		show_pane(shown_pane :: number, settings, cache, last_dock)
 	end
 end
 
@@ -2206,6 +1962,13 @@ local ui = tern.ui
 
 local PANEL_CSS = fill(
 	[==[
+$P .oup-compact { font: 500 12px/18px var(--mono); white-space: pre; }
+$P .oup-qgroup { display: flex; flex-direction: column; gap: 6px; padding: 8px 0; }
+$P .oup-qgroup + .oup-qgroup { border-top: 1px solid var(--l2); }
+$P .oup-qrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; min-height: 30px; }
+$P .oup-qname { flex: 1 1 180px; font: 400 11.5px/16px var(--mono); color: var(--t2); }
+$P .oup-qdest { display: flex; flex: none; align-items: center; gap: 8px; font: 400 11px/16px var(--sans); color: var(--t3); }
+$P .oup-qdest .oup-switch { margin-right: 0; }
 /* the settings panel, in the line's voice: mono micro-labels over hairlines, each provider in its own colors */
 $P {
 	display: flex;
@@ -2671,36 +2434,24 @@ end
 -- first), so it wraps between windows as the composer's does.
 local function preview_section(settings: Settings, preview: Model, rules: { string }): Node
 	local providers: { Node } = {}
-	local several = #preview.groups > 1
-	local n = 0
-	for g, group in preview.groups do
-		local palette = palette_for(settings, group.id, group.label)
-		local chips: { Node } = {}
-		for w, window in group.windows do
-			local part: Group = { key = group.key, id = group.id, label = if w == 1 then group.label else "", windows = { window }, resets = group.resets }
-			local line = line_of({ groups = { part }, others = {}, source = preview.source, title = "", signature = "" }, several)
-			n += 1
-			table.insert(chips, ui.el("div", { key = "w" .. w, class = "oup-chip", text = line.text, attrs = { ["data-ou-chip"] = n } }))
-			table.insert(
-				rules,
-				string.format(
-					"%s .oup-chip[data-ou-chip='%d'] {\n\t--ou-g1-a: %s;\n\t--ou-g1-b: %s;\n\tbackground-image: %s;\n}",
-					PANEL,
-					n,
-					palette.a,
-					palette.b or palette.a,
-					line_paint(line)
-				)
-			)
+	for _, group in preview.groups do
+		local text, lowest = quota_label(group, settings)
+		if text then
+			local palette = palette_for(settings, group.id, group.label)
+			local tone = tone_of(lowest)
+			local color = if tone == "bad" then "var(--bad)" elseif tone == "warn" then "var(--warn)" else palette.a
+			table.insert(providers, ui.el("span", { key = group.key, class = "oup-compact", text = text, title = group.label, attrs = { ["data-ou-provider"] = group.key } }))
+			table.insert(rules, PANEL .. " [data-ou-provider=" .. css_string(group.key) .. "] { color: " .. color .. "; }")
 		end
-		table.insert(providers, ui.el("div", { key = "g" .. g, class = "oup-pv" }, chips))
 	end
-	local glow = if #preview.groups == 1 then palette_for(settings, preview.groups[1].id, preview.groups[1].label).a else "var(--accent)"
-	table.insert(rules, string.format("%s .oup-stage {\n\t--ou-stage: %s;\n}", PANEL, glow))
 	if #providers == 0 then
-		table.insert(providers, ui.el("div", { class = "oup-empty", text = "Nothing to show yet. Focus an omp pane and its line appears here." }))
+		table.insert(providers, ui.el("div", { class = "oup-empty", text = "No enabled bar windows with usage data. Choose windows below or focus an updated omp pane." }))
 	end
-	return section("preview", "Line", "as the composer shows it", { ui.el("div", { class = "oup-stage" }, providers) })
+	local body: { Node } = { ui.el("div", { class = "oup-stage" }, providers) }
+	if last_dock and last_dock.status ~= nil and last_dock.status ~= "" and not last_dock.native then
+		table.insert(body, ui.el("div", { class = "oup-empty", text = "The last omp pane does not expose the separate quota control. Restart/resume that pane manually to display it; these settings are saved." }))
+	end
+	return section("preview", "Bar preview", "Shown only in the focused omp pane. The normal Usage window keeps all data.", body)
 end
 
 local function show_section(settings: Settings, providers: { Provider }): Node
@@ -2804,6 +2555,34 @@ local function providers_section(settings: Settings, providers: { Provider }): N
 	})
 end
 
+local function windows_section(settings: Settings, providers: { Provider }): Node
+	local groups: { Node } = {}
+	for _, provider in providers do
+		local _, windows = parse_line(provider.line)
+		if #windows == 0 then continue end
+		local rows: { Node } = { ui.el("span", { class = "oup-name", text = provider.label }) }
+		for _, window in windows do
+			local duration, scope = string.match(window.label, "^(%S+)%s*(.*)$")
+			local label = (WINDOW_NAMES[duration] or duration) .. (if scope ~= "" then " · " .. scope else "")
+			local controls: { Node } = { ui.el("span", { class = "oup-qname", text = label }) }
+			for _, surface in { "bar", "hover" } do
+				local on = window_enabled(settings, provider.id, window.label, surface)
+				local destination = if surface == "bar" then "Bar" else "Hover"
+				table.insert(controls, ui.el("span", { class = "oup-qdest" }, {
+					ui.el("span", { text = destination }),
+					ui.el("button", {
+						class = "oup-switch",
+						actions = { click = "window-" .. surface .. "=" .. provider.id .. "/" .. window.label },
+						attrs = { role = "switch", ["aria-checked"] = if on then "true" else "false", ["aria-label"] = provider.label .. " " .. label .. " in " .. (if surface == "bar" then "bottom bar" else "hover card"), ["data-on"] = if on then true else nil, ["data-quota-provider"] = provider.id, ["data-quota-window"] = window.label, ["data-quota-surface"] = surface },
+					}, { ui.el("span", { class = "oup-knob" }) }),
+				}))
+			end
+			table.insert(rows, ui.el("div", { key = window.label, class = "oup-qrow" }, controls))
+		end
+		table.insert(groups, ui.el("div", { key = provider.id, class = "oup-qgroup", attrs = { ["data-ou-pal"] = "p-" .. pal_key(color_key(provider.id, provider.label)) } }, rows))
+	end
+	return section("windows", "Quota windows", "Choose each quota pool independently for Bar and Hover. Bar keeps 5h → weekly → monthly priority among enabled windows. The normal Usage window is unchanged.", groups)
+end
 local function color_row(settings: Settings, provider: Provider, rules: { string }): Node
 	local key = color_key(provider.id, provider.label)
 	local pk = pal_key(key)
@@ -2897,6 +2676,7 @@ local function panel_state(cx: WindowCx, settings: Settings, cache: Cache?): Pan
 		table.insert(parts, provider.id .. "|" .. provider.label .. "|" .. provider.line)
 	end
 	table.insert(parts, preview.signature)
+	table.insert(parts, tostring(last_dock and last_dock.native))
 	return { settings = settings, providers = providers, preview = preview, keys = keys, sig = table.concat(parts, "\n") }
 end
 
@@ -2911,6 +2691,7 @@ local function panel_parts(state: PanelState): (Node, Node, string)
 		preview_section(state.settings, state.preview, rules),
 		show_section(state.settings, state.providers),
 		providers_section(state.settings, state.providers),
+		windows_section(state.settings, state.providers),
 		colors_section(state.settings, state.providers, rules),
 	})
 	return view, panel_dock(state.keys), table.concat(rules, "\n")
@@ -2929,7 +2710,7 @@ end
 -- Redraws the panel if what it shows changed (or `force`), from the poll's settings and cache when it has them.
 -- The drawing (the view, its sheet and the update, ~10 ms) runs in a call of its own, so a poll that also drew
 -- the line stays well inside its budget.
-sync_panel = function(cx: WindowCx, force: boolean, settings: Settings?, cache: Cache?)
+sync_panel = function(cx: WindowCx, force: boolean, settings: Settings?, cache: Cache?, immediate: boolean?)
 	local pane = panel_pane
 	if pane == nil then
 		return
@@ -2939,7 +2720,7 @@ sync_panel = function(cx: WindowCx, force: boolean, settings: Settings?, cache: 
 		return
 	end
 	panel_sig = state.sig
-	tern.timer(0, function(later: WindowCx?)
+	local function draw(later: WindowCx?)
 		if later == nil or panel_pane ~= pane or panel_sig ~= state.sig then
 			return -- closed, replaced, or a newer drawing is on its way
 		end
@@ -2952,7 +2733,8 @@ sync_panel = function(cx: WindowCx, force: boolean, settings: Settings?, cache: 
 			panel_pane = nil -- closed meanwhile
 			panel_sig = nil
 		end
-	end)
+	end
+	if immediate then draw(cx) else tern.timer(0, draw) end
 end
 
 -- This plugin's panel in this window, if one is open.
@@ -2977,6 +2759,10 @@ local function open_panel(cx: WindowCx)
 		sync_panel(cx, true)
 		cx.layout:focus(pane :: number)
 		return
+	end
+	if last_dock == nil then
+		local agent = shown_pane or some_agent(cx, nil)
+		if agent then last_dock = docks[agent] or { viewing = false, hide = {} }; shown_pane = agent end
 	end
 	local state = panel_state(cx, load_settings(), read_cache(now_ms()))
 	local view, dock, css = panel_parts(state)
@@ -3004,6 +2790,26 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean
 	elseif act == "toggle" then
 		store.set(KV_SELECTED, toggled(load_settings().selected, value))
 		store.set(KV_MODE, "selected") -- switching a provider is choosing which to show
+	elseif act == "window-bar" or act == "window-hover" then
+		local provider, label = string.match(value, "^([^/]+)/(.*)$")
+		if provider == nil or label == nil then return false end
+		local settings = load_settings()
+		local offered = settings.windows[provider] ~= nil and settings.windows[provider][label] ~= nil
+		for _, info in store.providers() do
+			if info.id ~= provider then continue end
+			local _, windows = parse_line(info.line)
+			for _, window in windows do
+				if window.label == label then offered = true end
+			end
+		end
+		if not offered then return false end
+		local windows = settings.windows[provider] or {}
+		local flags: any = windows[label] or {}
+		local surface = if act == "window-bar" then "bar" else "hover"
+		flags[surface] = not window_enabled(settings, provider, label, surface)
+		windows[label] = flags
+		settings.windows[provider] = windows
+		store.set(KV_WINDOWS, settings.windows)
 	elseif act == "up" or act == "down" or act == "top" or act == "bottom" then
 		move_provider(value, act)
 	elseif act == "named" then
@@ -3025,6 +2831,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean
 end)
 
 tern.on("pane_closed", function(ev: { pane: number }, _cx: WindowCx)
+	docks[ev.pane], bar_roots[ev.pane] = nil, nil
+	if shown_pane == ev.pane then shown_pane, last_dock = nil, nil end
+	request_refresh()
 	if ev.pane == panel_pane then
 		panel_pane = nil
 		panel_sig = nil
@@ -3071,22 +2880,15 @@ end
 
 tern.command({
 	id = "panel",
-	title = "omp Usage: Settings panel",
+	title = "omp Usage: Settings",
 	icon = "sliders",
-	keys = { PANEL_KEYS },
 	run = open_panel,
 })
 
 tern.command({
 	id = "settings",
-	title = "omp Usage: Settings…",
+	title = "omp Usage: Quick options",
 	icon = "gauge",
 	run = open_menu,
 })
 
--- `usage` in the status bar, on an agent pane: a click opens the panel.
-local STATUS: { StatusSegment } = { { text = "usage", icon = "gauge", command = PANEL_ACTION } }
-
-tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
-	return if pane.kind == "agent" then STATUS else nil
-end)
