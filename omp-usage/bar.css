@@ -1,5 +1,18 @@
-/* Tern cuts the session cost from omp's composer bar before any status line segment, so with a long status line
-   (the `full` preset) it never shows. Keep it: Tern then drops the lowest-priority segments to make room. */
-.sf-row[data-role='omp.composer.bar'] > [data-role='omp.composer.usage'].sf-cut {
-	display: block !important;
+/* Only the plugin's active-pane sheet reveals its own quota item; native cost is never styled. */
+.sf-col[data-role^='omp.editor'] [data-role='omp.composer.provider-usage'] {
+	display: none;
+	border-left: 1px solid var(--l2);
+	margin-left: 4px;
+	align-self: center;
+	height: 16px;
+	flex-shrink: 0;
+}
+.sf-col[data-role^='omp.editor'] [data-role='omp.composer.provider-usage.data'] {
+	display: none !important;
+}
+
+/* Console has no built-in divider for the custom Queue action. */
+.sf-chat-console [data-role='omp.composer.bar'] > [data-role='omp.composer.queue'] {
+	border-left: 1px solid var(--l2);
+	flex-shrink: 0;
 }
